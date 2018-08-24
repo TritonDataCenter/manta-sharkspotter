@@ -9,6 +9,7 @@
 var mod_assert = require('assert-plus');
 var mod_bunyan = require('bunyan');
 var mod_getopt = require('posix-getopt');
+var mod_jsprim = require('jsprim');
 var mod_moray = require('moray');
 var mod_vasync = require('vasync');
 
@@ -20,7 +21,7 @@ var EventEmitter = require('events').EventEmitter;
  * sharkspotter.js - find objects that should belong on a shark
  *
  * The user provides a shark name (e.g. 2.stor) and a Moray shard name
- * (e.g. 3.moray). This script uses Moray's `findobjects` to query the backend
+ * (e.g. 3.moray). This script uses Moray's `sql` RPC to query the backend
  * database for _all_ objects between certain chunks of _id/_idx values of the
  * Manta table. The objects are then filtered to find only those that include
  * the given shark's storage id. Those results are written line-by-line to a
@@ -38,8 +39,8 @@ function SharkSpotter(opts) {
 	mod_assert.string(opts.moray, 'opts.moray');
 	mod_assert.string(opts.shark, 'opts.shark');
 	mod_assert.string(opts.nameservice, 'opts.nameservice');
-	mod_assert.number(opts.begin, 'opts.begin');
-	mod_assert.number(opts.end, 'opts.end');
+	mod_assert.optionalNumber(opts.begin, 'opts.begin');
+	mod_assert.optionalNumber(opts.end, 'opts.end');
 	mod_assert.number(opts.chunk_size, 'opts.chunk_size');
 
 	var self = this;
@@ -48,10 +49,9 @@ function SharkSpotter(opts) {
 	this.sf_moray = opts.moray;
 	this.sf_shark = opts.shark;
 	this.sf_nameservice = opts.nameservice;
-	this.sf_begin_id = opts.begin;
-	this.sf_end_id = opts.end;
-	this.sf_ids_to_go = this.sf_end_id - this.sf_begin_id + 1;
 	this.sf_chunk_size = opts.chunk_size;
+	this.sf_begin_id = opts.begin || 0;
+	this.sf_end_id = opts.end;
 
 	/* open output file in current directory */
 	this.sf_outfile = mod_util.format('./%s.%d.out', this.sf_moray,
@@ -71,7 +71,7 @@ function SharkSpotter(opts) {
 		self.sf_log.error({
 			'error': err
 		}, 'error writing data file');
-		this.emit('error', err);
+		self.emit('error', err);
 	});
 
 	this.sf_log.info({
@@ -96,41 +96,55 @@ SharkSpotter.prototype.find = function find() {
 	var records = [];
 	var end_id, begin_id;
 	var chunk_size = this.sf_chunk_size;
-	var filter;
+	var query;
 	var start_wall_time, end_wall_time;
 	var duration_ms;
+	var id_column;
 
-	begin_id = this.sf_begin_id;
-	end_id = begin_id + 1; /* so we get past the initial 'whilst' check */
 
 	function read_chunk(cb) {
+		var records_seen = 0;
+		chunk_size = self.sf_chunk_size;
 		if (self.sf_ids_to_go < chunk_size) {
+			/* there is only a partial chunk left */
 			chunk_size = self.sf_ids_to_go;
 		}
 
 		end_id = begin_id + chunk_size - 1;
-		filter = mod_util.format(
-		    '(&(_id>=%d)(_id<=%d)(type=object))',
-		    begin_id, end_id);
+		query = mod_util.format('SELECT * FROM manta WHERE' +
+		    ' %s >= %d AND %s <= %d AND type = \'object\';',
+		    id_column, begin_id, id_column, end_id);
 
 		self.sf_log.info({
-			'filter': filter,
+			'query': query,
 			'moray': self.sf_moray,
 			'begin_id': begin_id,
 			'end_id': end_id,
-			'ids_to_go': self.sf_ids_to_go
-		}, 'find: begin');
+			'chunk_size': chunk_size,
+			'ids_to_go': self.sf_ids_to_go,
+			'id_column': id_column,
+			'last_id': self.sf_end_id
+		}, 'find %s: begin', id_column);
 
 		start_wall_time = new Date();
-		resp = self.sf_morayclient.findObjects('manta', filter, {
+		resp = self.sf_morayclient.sql(query, {
 			'limit': chunk_size,
 			'no_count': true
 		});
-		records = [];
 
 		resp.on('record', function (record) {
+			records_seen++;
+			self.sf_log.debug({
+				'moray': self.sf_moray,
+				'records_seen': records_seen,
+				'last_id': self.sf_end_id,
+				'begin_id': begin_id,
+				'end_id': end_id,
+				'chunk_size': chunk_size
+			}, 'record received');
+			var value = JSON.parse(record._value);
 			var keep = false;
-			var sharks = record.value.sharks;
+			var sharks = value.sharks;
 			var stor_ids = [];
 			sharks.forEach(function (sharkObj) {
 				stor_ids.push(sharkObj['manta_storage_id']);
@@ -143,66 +157,208 @@ SharkSpotter.prototype.find = function find() {
 			});
 			if (keep) {
 				records.push(mod_util.format('%s %s %s',
-				    record.value.owner, record.value.objectId,
+				    value.owner, value.objectId,
 				    stor_ids.join(' ')));
 			}
 		});
 
 		resp.on('error', function (err) {
+			end_wall_time = new Date();
 			self.sf_log.error({
 				'moray': self.sf_moray,
-				'begin_id': self.sf_begin_id,
-				'end_id': self.sf_end_id,
+				'begin_id': begin_id,
+				'end_id': end_id,
+				'duration_ms': end_wall_time - start_wall_time,
 				'error': err
-			}, 'find: err');
+			}, 'find %s: err', id_column);
 			cb(err);
 		});
 
 		resp.on('end', function () {
 			end_wall_time = new Date();
 			/* write the object metadata to disk asynchronously */
-			self.sf_write_stream.write(records.join('\n'));
-			self.sf_write_stream.write('\n');
+			if (records.length > 0) {
+				self.sf_write_stream.write(records.join('\n'));
+				self.sf_write_stream.write('\n');
+			}
+
+			self.sf_ids_to_go -= chunk_size; /* finished chunk */
 
 			self.sf_log.info({
-				'filter': filter,
+				'query': query,
 				'moray': self.sf_moray,
 				'begin_id': begin_id,
 				'end_id': end_id,
 				'kept': records.length,
+				'id_column': id_column,
+				'ids_to_go': self.sf_ids_to_go,
 				'discarded': chunk_size - records.length,
-				'duration_ms': end_wall_time - start_wall_time
-			}, 'find: end');
+				'duration_ms': end_wall_time - start_wall_time,
+				'last_id': self.sf_end_id
+			}, 'find %s: end', id_column);
 
-			self.sf_ids_to_go -= chunk_size; /* finished chunk */
 			begin_id = end_id + 1; /* move to the next chunk */
 			cb();
 		});
 	}
-
-	this.sf_start_time = new Date();
-	this.sf_log.info({
-		'start_time': this.sf_start_time
-	}, 'shark spotter: begin');
-	mod_vasync.whilst(
-		function has_ids_left() {
-			return (self.sf_ids_to_go > 0);
-		},
-		read_chunk,
-		function done(err) {
-			self.sf_end_time = new Date();
-			duration_ms = self.sf_end_time - self.sf_start_time;
-			self.sf_log.info({
-				'start_time': self.sf_start_time,
-				'end_time': self.sf_end_time,
-				'duration_ms': duration_ms
-			}, 'shark spotter: end');
+	
+	function find_largest__id_value(_, cb) {
+		self.get_largest_id('_id', function (err, max) {
 			if (err) {
-				self.emit('error', err);
-				return;
+				self.sf_log.fatal({
+					'error': err
+				}, 'could not get max _id value');
+			} else {
+				self.sf_max__id = mod_jsprim.parseInteger(max);
 			}
-			self.emit('end');
+			cb(err);
 		});
+	}
+
+	function find_largest__idx_value(_, cb) {
+		self.get_largest_id('_idx',
+		    function (err, max) {
+
+			if (err) {
+				/* _idx won't exist in all Manta deployments */
+				self.sf_log.warn({
+					'error': err
+				}, 'could not get max _idx value');
+			} else {
+				self.sf_max__idx = mod_jsprim.parseInteger(max);
+			}
+			cb();
+		});
+	}
+
+	function iterate__ids(_, cb) {
+		id_column = '_id';
+
+		/* user didn't specify an end ID */
+		if (self.sf_end_id === undefined) {
+			/* pick the larger of _id and _idx */
+			self.sf_end_id = self.sf_max__idx ?
+			    self.sf_max__idx : self.sf_max__id;
+		}
+		begin_id = self.sf_begin_id;
+		end_id = begin_id + 1; /* get past the initial 'whilst' check */
+
+		var start_time = new Date();
+
+		if (self.sf_end_id > self.sf_max__id) {
+			/* user is scanning outside the range of _id values */
+			self.sf_ids_to_go = self.sf_max__id -
+			    self.sf_begin_id + 1;
+		} else {
+			/* user is scanning in the range of the _id values */
+			self.sf_ids_to_go = self.sf_end_id -
+			    self.sf_begin_id + 1;
+		}
+		self.sf_log.info({
+			'start_time': start_time
+		}, 'shark spotter _id: begin');
+
+		mod_vasync.whilst(
+			function has__ids_left() {
+				return (self.sf_ids_to_go > 0);
+			},
+			read_chunk,
+			function done(err) {
+				end_time = new Date();
+				duration_ms = end_time - start_time;
+				self.sf_log.info({
+					'start_time': start_time,
+					'end_time': end_time,
+					'duration_ms': duration_ms
+				}, 'shark spotter _id: end');
+				cb(err);
+			});
+	}
+
+	function iterate__idxs(_, cb) {
+		id_column = '_idx';
+		var start_time = new Date();
+		self.sf_log.info({
+			'start_time': start_time
+		}, 'shark spotter _idx: begin');
+
+		/*
+		 * we want this to scan from the greater of (max_id + 1)
+		 * and (start_id)
+		 */
+		if (self.sf_max__id + 1 > self.sf_begin_id) {
+			begin_id = self.sf_max__id + 1;
+		} else {
+			begin_id = self.sf_begin_id;
+		}
+		self.sf_ids_to_go = self.sf_max__idx - begin_id + 1;
+		mod_vasync.whilst(
+			function has__idxs_left() {
+				return (self.sf_ids_to_go > 0);
+			},
+			read_chunk,
+			function done(err) {
+				end_time = new Date();
+				duration_ms = end_time - start_time;
+				self.sf_log.info({
+					'start_time': start_time,
+					'end_time': end_time,
+					'duration_ms': duration_ms
+				}, 'shark spotter _idx: end');
+				cb(err);
+			});
+	}
+
+	/*
+	 * find the boundaries of _id and _idx, then iterate through them
+	 * in succession
+	 */
+	mod_vasync.pipeline({
+		'funcs': [
+			find_largest__id_value,
+			find_largest__idx_value,
+			iterate__ids,
+			iterate__idxs
+		]
+	}, function (err, results) {
+		if (err) {
+			self.sf_log.error({
+				'error': err
+			}, 'error finding objects');
+			self.emit('error', err);
+			return;
+		}
+		self.emit('end');
+	});
+
+
+};
+
+SharkSpotter.prototype.get_largest_id = function get_largest_id(idstr, cb) {
+	mod_assert.string(idstr, 'idstr');
+
+	var resp, res;
+	var self = this;
+
+	var query = mod_util.format('SELECT MAX(%s) FROM manta;', idstr);
+	resp = this.sf_morayclient.sql(query, {
+		'limit': 1,
+		'no_count': true
+	});
+
+	/* we only want one row, so only listen for this event once */
+	resp.once('record', function (record) {
+		res = record['max'];
+	});
+
+	resp.on('error', function (err) {
+		cb(err);
+	});
+
+	resp.on('end', function () {
+		cb(null, res);
+	});
+	
 };
 
 /*
@@ -211,11 +367,11 @@ SharkSpotter.prototype.find = function find() {
 SharkSpotter.prototype.stop = function stop() {
 	var self = this;
 	this.sf_log.info('stopping');
-	this.sf_write_stream.end();
+	this.sf_morayclient.close();
 	this.sf_write_stream.on('finish', function () {
 		self.sf_log.info('write stream finished');
-		self.sf_morayclient.close();
 	});
+	this.sf_write_stream.end();
 };
 
 function usage(msg) {
@@ -228,7 +384,10 @@ function usage(msg) {
 		mod_util.format('%s', basename),
 		'  -b, --begin		manta relation _id to start search',
 		'			from',
+		'			default is 0',
 		'  -e, --end		manta relation _id to end search at',
+		'			default is the larger of max(_id) and',
+		'			max(_idx)',
 		'  -d, --domain		domain name of manta services',
 		'			e.g. us-east.joyent.us',
 		'  -m, --moray		moray shard to search',
@@ -250,6 +409,7 @@ function main() {
 	var opts;
 	var parser;
 	var moray, shark, domain, begin, end, chunk_size;
+	var start_time;
 
 	parser = new mod_getopt.BasicParser(
 	    'm:(moray)b:(begin)e:(end)d:(domain)s:(shark)c:(chunk-size)h(help)',
@@ -294,13 +454,13 @@ function main() {
 		}
 	}
 
-	/* Primitive input validation. */
+	/* Very primitive input validation. */
 	if (begin > end) {
 		usage('starting ID is greater than ending ID');
 	}
-	if (begin === undefined || end === undefined) {
+	/*if (begin === undefined || end === undefined) {
 		usage('must provide beginning and ending IDs');
-	}
+	}*/
 	if (moray === undefined) {
 		usage('must provide moray shard to search');
 	}
@@ -328,6 +488,11 @@ function main() {
 	var sharkspotter = new SharkSpotter(opts);
 
 	sharkspotter.on('connect', function () {
+		start_time = new Date();
+		log.info({
+			'start_time': start_time,
+			'options': opts
+		}, 'sharkspotter: begin');
 		sharkspotter.find();
 	});
 
@@ -338,7 +503,12 @@ function main() {
 	});
 
 	sharkspotter.on('end', function () {
+		end_time = new Date();
 		sharkspotter.stop();
+		log.info({
+			'end_time': end_time,
+			'duration_ms': end_time - start_time
+		}, 'sharkspotter: done');
 	});
 }
 
