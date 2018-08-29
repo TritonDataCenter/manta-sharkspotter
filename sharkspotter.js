@@ -132,7 +132,11 @@ SharkSpotter.prototype.find = function find() {
 			'no_count': true
 		});
 
-		resp.on('record', function (record) {
+		/*
+		 * decide whether or not to record an object that we receive
+		 * from moray
+		 */
+		function recordObject (record) {
 			records_seen++;
 			self.sf_log.debug({
 				'moray': self.sf_moray,
@@ -142,25 +146,46 @@ SharkSpotter.prototype.find = function find() {
 				'end_id': end_id,
 				'chunk_size': chunk_size
 			}, 'record received');
+
+			/* exit early if no mention of the target shark */
+			if (record._value.indexOf(self.sf_shark) < 0) {
+				return;
+			}
+
 			var value = JSON.parse(record._value);
-			var keep = false;
 			var sharks = value.sharks;
+
+			var keep = false;
 			var stor_ids = [];
-			sharks.forEach(function (sharkObj) {
-				stor_ids.push(sharkObj['manta_storage_id']);
+			var arg = {
+				'stor_ids': stor_ids,
+				'keep': keep
+			};
+			sharks.forEach(checkForShark, arg);
 
-				if (sharkObj['manta_storage_id']
-				    === self.sf_shark) {
-
-					keep = true;
-				}
-			});
-			if (keep) {
+			if (arg.keep) {
 				records.push(mod_util.format('%s %s %s',
 				    value.owner, value.objectId,
-				    stor_ids.join(' ')));
+				    arg.stor_ids.join(' ')));
 			}
-		});
+		}
+
+		/*
+		 * look at the received record. If it includes the target shark
+		 * in the storage ID array then mark that we would like to
+		 * record the object.
+		 */
+		function checkForShark(sharkObj) {
+			this.stor_ids.push(sharkObj['manta_storage_id']);
+
+			if (sharkObj['manta_storage_id']
+			    === self.sf_shark) {
+
+				this.keep = true;
+			}
+		}
+
+		resp.on('record', recordObject);
 
 		resp.on('error', function (err) {
 			end_wall_time = new Date();
@@ -180,6 +205,7 @@ SharkSpotter.prototype.find = function find() {
 			if (records.length > 0) {
 				self.sf_write_stream.write(records.join('\n'));
 				self.sf_write_stream.write('\n');
+				records = [];
 			}
 
 			self.sf_ids_to_go -= chunk_size; /* finished chunk */
@@ -209,7 +235,12 @@ SharkSpotter.prototype.find = function find() {
 					'error': err
 				}, 'could not get max _id value');
 			} else {
-				self.sf_max__id = mod_jsprim.parseInteger(max);
+				if (typeof(max) === 'number') {
+					self.sf_max__id = max;
+				} else {
+					self.sf_max__id =
+					    mod_jsprim.parseInteger(max);
+				}
 			}
 			cb(err);
 		});
@@ -283,14 +314,24 @@ SharkSpotter.prototype.find = function find() {
 		}, 'shark spotter _idx: begin');
 
 		/*
-		 * we want this to scan from the greater of (max_id + 1)
-		 * and (start_id)
+		 * we want this to scan from the greater of (max__id + 1)
+		 * and (start_id).
 		 */
 		if (self.sf_max__id + 1 > self.sf_begin_id) {
 			begin_id = self.sf_max__id + 1;
 		} else {
 			begin_id = self.sf_begin_id;
 		}
+
+		/*
+		 * don't iterate through the _idx column if the user wants to
+		 * stop before the _idx range begins
+		 */
+		if (begin_id > self.sf_end_id) {
+			cb();
+			return;
+		}
+
 		self.sf_ids_to_go = self.sf_max__idx - begin_id + 1;
 		mod_vasync.whilst(
 			function has__idxs_left() {

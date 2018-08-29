@@ -16,6 +16,8 @@
 BEGIN
 {
 	printf("waiting for records from moray...\n");
+  do_print = 0;
+	self->records_last_print = 0;
 }
 
 bunyan*:::log-debug
@@ -32,15 +34,18 @@ strtok(json(copyinstr(arg0), "moray"), ".") == $1
 	last_id = strtoll(json(js, "last_id"));
 	records_seen = strtoll(json(js, "records_seen"));
 
+
 	progress = (begin_id + records_seen - 1);
 	shardnum = strtok(moray, ".moray");
 
-	printf("%s.moray: %d%% [ %d / %d ]\n",
+	printf("%s.moray: %d%%, %d/s [ %d / %d ]\n",
 	    shardnum,
 	    (progress * 100) / last_id,
+			records_seen - self->records_last_print,
 	    progress,
 	    last_id);
 	do_print = 0;
+	self->records_last_print = records_seen;
 }
 
 bunyan*:::log-info
