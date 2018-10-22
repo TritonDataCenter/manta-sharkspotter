@@ -42,6 +42,7 @@ function SharkSpotter(opts) {
 	mod_assert.optionalNumber(opts.begin, 'opts.begin');
 	mod_assert.optionalNumber(opts.end, 'opts.end');
 	mod_assert.number(opts.chunk_size, 'opts.chunk_size');
+	mod_assert.bool(opts.keep_mpu, 'opts.keep_mpu');
 
 	var self = this;
 
@@ -52,6 +53,9 @@ function SharkSpotter(opts) {
 	this.sf_chunk_size = opts.chunk_size;
 	this.sf_begin_id = opts.begin || 0;
 	this.sf_end_id = opts.end;
+	this.sf_keep_mpu = opts.keep_mpu;
+
+	this.sf_mpu_discarded = 0; /* track number of MPUs ignored */
 
 	/* open output file in current directory */
 	this.sf_outfile = mod_util.format('./%s.%d.out', this.sf_moray,
@@ -97,10 +101,12 @@ SharkSpotter.prototype.find = function find() {
 	var end_id, begin_id;
 	var chunk_size = this.sf_chunk_size;
 	var query;
-	var start_wall_time, end_wall_time;
+	var start_wall_time, end_wall_time, end_time;
 	var duration_ms;
 	var id_column;
 
+	var mpu_path_regex = new RegExp('/[a-z0-9]{8}-[a-z0-9]{4}' +
+		'-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{12}/uploads/*');
 
 	function read_chunk(cb) {
 		var records_seen = 0;
@@ -133,10 +139,15 @@ SharkSpotter.prototype.find = function find() {
 		});
 
 		/*
-		 * decide whether or not to record an object that we receive
-		 * from moray
+		 * Decide whether or not to record an object that we receive
+		 * from moray.
+		 *
+		 * There are currently two instances where we ignore objects in
+		 * the table:
+		 * - the object shouldn't exist on the specified shark (common)
+		 * - the object is an MPU part (less common)
 		 */
-		function recordObject (record) {
+		function recordObject(record) {
 			records_seen++;
 			self.sf_log.debug({
 				'moray': self.sf_moray,
@@ -147,8 +158,13 @@ SharkSpotter.prototype.find = function find() {
 				'chunk_size': chunk_size
 			}, 'record received');
 
-			/* exit early if no mention of the target shark */
 			if (record._value.indexOf(self.sf_shark) < 0) {
+				return;
+			}
+
+			if (self.sf_keep_mpu === false && mpu_path_regex.test(
+			    record.dirname)) {
+				self.sf_mpu_discarded++;
 				return;
 			}
 
@@ -166,7 +182,7 @@ SharkSpotter.prototype.find = function find() {
 			if (arg.keep) {
 				records.push(mod_util.format('%s %s %s',
 				    value.owner, value.objectId,
-				    arg.stor_ids.join(' ')));
+				    arg.stor_ids.join(' '), value.contentMD5));
 			}
 		}
 
@@ -205,7 +221,6 @@ SharkSpotter.prototype.find = function find() {
 			if (records.length > 0) {
 				self.sf_write_stream.write(records.join('\n'));
 				self.sf_write_stream.write('\n');
-				records = [];
 			}
 
 			self.sf_ids_to_go -= chunk_size; /* finished chunk */
@@ -223,11 +238,13 @@ SharkSpotter.prototype.find = function find() {
 				'last_id': self.sf_end_id
 			}, 'find %s: end', id_column);
 
+			records = [];
+
 			begin_id = end_id + 1; /* move to the next chunk */
 			cb();
 		});
 	}
-	
+
 	function find_largest__id_value(_, cb) {
 		self.get_largest_id('_id', function (err, max) {
 			if (err) {
@@ -235,7 +252,7 @@ SharkSpotter.prototype.find = function find() {
 					'error': err
 				}, 'could not get max _id value');
 			} else {
-				if (typeof(max) === 'number') {
+				if (typeof (max) === 'number') {
 					self.sf_max__id = max;
 				} else {
 					self.sf_max__id =
@@ -369,6 +386,7 @@ SharkSpotter.prototype.find = function find() {
 			self.emit('error', err);
 			return;
 		}
+		self.sf_log.info('skipped %d MPU parts', self.sf_mpu_discarded);
 		self.emit('end');
 	});
 
@@ -399,7 +417,7 @@ SharkSpotter.prototype.get_largest_id = function get_largest_id(idstr, cb) {
 	resp.on('end', function () {
 		cb(null, res);
 	});
-	
+
 };
 
 /*
@@ -437,7 +455,8 @@ function usage(msg) {
 		'			e.g. 3.stor',
 		'  -c, --chunk-size	number of objects to search in each PG',
 		'			query',
-		'			default is 10000'
+		'			default is 10000',
+		' -k, --keep-mpu	(bool) collect MPU part data'
 	].join('\n'));
 
 	process.exit(1);
@@ -450,10 +469,12 @@ function main() {
 	var opts;
 	var parser;
 	var moray, shark, domain, begin, end, chunk_size;
-	var start_time;
+	var start_time, end_time;
+	var keep_mpu = false;
 
 	parser = new mod_getopt.BasicParser(
-	    'm:(moray)b:(begin)e:(end)d:(domain)s:(shark)c:(chunk-size)h(help)',
+	    'm:(moray)b:(begin)e:(end)d:(domain)s:(shark)c:(chunk-size)' +
+	    'h(help)k(keep-mpu)',
 	    process.argv);
 
 	while ((option = parser.getopt()) !== undefined) {
@@ -485,6 +506,21 @@ function main() {
 				usage('chunk size must be greater than 0');
 			}
 			break;
+		case 'k':
+			/*
+			 * We have to work around some MPU (multi-part
+			 * upload) behavior. Specifically, MPU doesn't remove
+			 * 'part' data records from the 'manta' table after
+			 * MPUs are committed. The part files are removed from
+			 * storage nodes as part of the MPU commit process.
+			 *
+			 * It's difficult to determine if MPU parts should
+			 * exist on a storage node, or if they'll exist when
+			 * sharkspotter data is analyzed later. We'll omit MPU
+			 * parts unless the user _really_ wants them.
+			 */
+			keep_mpu = true;
+			break;
 		case 'h':
 			usage();
 			break;
@@ -499,9 +535,6 @@ function main() {
 	if (begin > end) {
 		usage('starting ID is greater than ending ID');
 	}
-	/*if (begin === undefined || end === undefined) {
-		usage('must provide beginning and ending IDs');
-	}*/
 	if (moray === undefined) {
 		usage('must provide moray shard to search');
 	}
@@ -523,7 +556,8 @@ function main() {
 		'nameservice': mod_util.format('%s.%s', 'nameservice', domain),
 		'begin': begin,
 		'end': end,
-		'chunk_size': chunk_size
+		'chunk_size': chunk_size,
+		'keep_mpu': keep_mpu
 	};
 
 	var sharkspotter = new SharkSpotter(opts);
