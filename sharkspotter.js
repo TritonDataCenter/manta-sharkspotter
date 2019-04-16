@@ -12,10 +12,13 @@ var mod_getopt = require('posix-getopt');
 var mod_jsprim = require('jsprim');
 var mod_moray = require('moray');
 var mod_vasync = require('vasync');
+var mod_verror = require('verror');
 
 var mod_fs = require('fs');
 var mod_util = require('util');
 var EventEmitter = require('events').EventEmitter;
+
+var OVERLOAD_TIMEOUT = 5000;
 
 /*
  * sharkspotter.js - find objects that should belong on a shark
@@ -110,6 +113,7 @@ SharkSpotter.prototype.find = function find() {
 
 	function read_chunk(cb) {
 		var records_seen = 0;
+		var overloaded = false;
 		chunk_size = self.sf_chunk_size;
 		if (self.sf_ids_to_go < chunk_size) {
 			/* there is only a partial chunk left */
@@ -212,10 +216,32 @@ SharkSpotter.prototype.find = function find() {
 				'duration_ms': end_wall_time - start_wall_time,
 				'error': err
 			}, 'find %s: err', id_column);
-			cb(err);
+			if (mod_verror.hasCauseWithName(err,
+			    'NoDatabasePeersError')) {
+				overloaded = true;
+				/*
+				 * If moray is overloaded, sleep for a while
+				 * and then try again.
+				 *
+				 * This uses recursion, which is not a good way
+				 * to do this, but it's a low risk change.
+				 */
+				self.sf_log.info({
+					'moray': self.sf_moray,
+					'begin_id': begin_id,
+					'end_id': end_id
+				}, 'find: %s: restarting chunk', id_column);
+				records = [];
+				setTimeout(read_chunk, OVERLOAD_TIMEOUT, cb);
+			} else {
+				cb(err);
+			}
 		});
 
 		resp.on('end', function () {
+			if (overloaded) {
+				return;
+			}
 			end_wall_time = new Date();
 			/* write the object metadata to disk asynchronously */
 			if (records.length > 0) {
