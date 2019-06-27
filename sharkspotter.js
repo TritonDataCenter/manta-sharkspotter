@@ -18,6 +18,8 @@ var mod_fs = require('fs');
 var mod_util = require('util');
 var EventEmitter = require('events').EventEmitter;
 
+var UUIDBloomFilter = require('./uuidbloom');
+
 var OVERLOAD_TIMEOUT = 5000;
 
 /*
@@ -40,7 +42,7 @@ function SharkSpotter(opts) {
 	mod_assert.object(opts, 'opts');
 	mod_assert.object(opts.log, 'opts.log');
 	mod_assert.string(opts.moray, 'opts.moray');
-	mod_assert.string(opts.shark, 'opts.shark');
+	mod_assert.object(opts.filter, 'opts.filter');
 	mod_assert.string(opts.nameservice, 'opts.nameservice');
 	mod_assert.optionalNumber(opts.begin, 'opts.begin');
 	mod_assert.optionalNumber(opts.end, 'opts.end');
@@ -51,7 +53,7 @@ function SharkSpotter(opts) {
 
 	this.sf_log = opts.log;
 	this.sf_moray = opts.moray;
-	this.sf_shark = opts.shark;
+	this.sf_filter = opts.filter;
 	this.sf_nameservice = opts.nameservice;
 	this.sf_chunk_size = opts.chunk_size;
 	this.sf_begin_id = opts.begin || 0;
@@ -71,14 +73,6 @@ function SharkSpotter(opts) {
 			'resolvers': [ this.sf_nameservice ],
 			'defaultPort': 2020
 		}
-	});
-
-	this.sf_write_stream = mod_fs.createWriteStream(this.sf_outfile);
-	this.sf_write_stream.on('error', function (err) {
-		self.sf_log.error({
-			'error': err
-		}, 'error writing data file');
-		self.emit('error', err);
 	});
 
 	this.sf_log.info({
@@ -142,67 +136,10 @@ SharkSpotter.prototype.find = function find() {
 			'no_count': true
 		});
 
-		/*
-		 * Decide whether or not to record an object that we receive
-		 * from moray.
-		 *
-		 * There are currently two instances where we ignore objects in
-		 * the table:
-		 * - the object shouldn't exist on the specified shark (common)
-		 * - the object is an MPU part (less common)
-		 */
 		function recordObject(record) {
 			records_seen++;
-			self.sf_log.debug({
-				'moray': self.sf_moray,
-				'records_seen': records_seen,
-				'last_id': self.sf_end_id,
-				'begin_id': begin_id,
-				'end_id': end_id,
-				'chunk_size': chunk_size
-			}, 'record received');
-
-			if (record._value.indexOf(self.sf_shark) < 0) {
-				return;
-			}
-
-			if (self.sf_keep_mpu === false && mpu_path_regex.test(
-			    record.dirname)) {
-				self.sf_mpu_discarded++;
-				return;
-			}
-
 			var value = JSON.parse(record._value);
-			var sharks = value.sharks;
-
-			var keep = false;
-			var stor_ids = [];
-			var arg = {
-				'stor_ids': stor_ids,
-				'keep': keep
-			};
-			sharks.forEach(checkForShark, arg);
-
-			if (arg.keep) {
-				records.push(mod_util.format('%s %s %s',
-				    value.owner, value.objectId,
-				    arg.stor_ids.join(' '), value.contentMD5));
-			}
-		}
-
-		/*
-		 * look at the received record. If it includes the target shark
-		 * in the storage ID array then mark that we would like to
-		 * record the object.
-		 */
-		function checkForShark(sharkObj) {
-			this.stor_ids.push(sharkObj['manta_storage_id']);
-
-			if (sharkObj['manta_storage_id']
-			    === self.sf_shark) {
-
-				this.keep = true;
-			}
+			self.sf_filter.add(value.objectId);
 		}
 
 		resp.on('record', recordObject);
@@ -231,7 +168,6 @@ SharkSpotter.prototype.find = function find() {
 					'begin_id': begin_id,
 					'end_id': end_id
 				}, 'find: %s: restarting chunk', id_column);
-				records = [];
 				setTimeout(read_chunk, OVERLOAD_TIMEOUT, cb);
 			} else {
 				cb(err);
@@ -243,11 +179,6 @@ SharkSpotter.prototype.find = function find() {
 				return;
 			}
 			end_wall_time = new Date();
-			/* write the object metadata to disk asynchronously */
-			if (records.length > 0) {
-				self.sf_write_stream.write(records.join('\n'));
-				self.sf_write_stream.write('\n');
-			}
 
 			self.sf_ids_to_go -= chunk_size; /* finished chunk */
 
@@ -256,15 +187,11 @@ SharkSpotter.prototype.find = function find() {
 				'moray': self.sf_moray,
 				'begin_id': begin_id,
 				'end_id': end_id,
-				'kept': records.length,
 				'id_column': id_column,
 				'ids_to_go': self.sf_ids_to_go,
-				'discarded': chunk_size - records.length,
 				'duration_ms': end_wall_time - start_wall_time,
 				'last_id': self.sf_end_id
 			}, 'find %s: end', id_column);
-
-			records = [];
 
 			begin_id = end_id + 1; /* move to the next chunk */
 			cb();
@@ -453,10 +380,7 @@ SharkSpotter.prototype.stop = function stop() {
 	var self = this;
 	this.sf_log.info('stopping');
 	this.sf_morayclient.close();
-	this.sf_write_stream.on('finish', function () {
-		self.sf_log.info('write stream finished');
-	});
-	this.sf_write_stream.end();
+	this.sf_filter.close();
 };
 
 function usage(msg) {
@@ -477,7 +401,7 @@ function usage(msg) {
 		'			e.g. us-east.joyent.us',
 		'  -m, --moray		moray shard to search',
 		'			e.g. 2.moray',
-		'  -s, --shark		shark to search objects in moray for',
+		'  -f, --filter         path to filter file to build',
 		'			e.g. 3.stor',
 		'  -c, --chunk-size	number of objects to search in each PG',
 		'			query',
@@ -494,12 +418,12 @@ function main() {
 
 	var opts;
 	var parser;
-	var moray, shark, domain, begin, end, chunk_size;
+	var moray, filterPath, domain, begin, end, chunk_size;
 	var start_time, end_time;
 	var keep_mpu = false;
 
 	parser = new mod_getopt.BasicParser(
-	    'm:(moray)b:(begin)e:(end)d:(domain)s:(shark)c:(chunk-size)' +
+	    'm:(moray)b:(begin)e:(end)d:(domain)f:(filter)c:(chunk-size)' +
 	    'h(help)k(keep-mpu)',
 	    process.argv);
 
@@ -523,8 +447,8 @@ function main() {
 				usage('invalid ending ID');
 			}
 			break;
-		case 's':
-			shark = option.optarg;
+		case 'f':
+			filterPath = option.optarg;
 			break;
 		case 'c':
 			chunk_size = parseInt(option.optarg, 10);
@@ -564,8 +488,8 @@ function main() {
 	if (moray === undefined) {
 		usage('must provide moray shard to search');
 	}
-	if (shark === undefined) {
-		usage('must provide shark to search for');
+	if (filterPath === undefined) {
+		usage('must provide path for bloom filter');
 	}
 	if (domain === undefined) {
 		usage('must provide domain name');
@@ -578,7 +502,7 @@ function main() {
 	opts = {
 		'log': log,
 		'moray': mod_util.format('%s.%s', moray, domain),
-		'shark': mod_util.format('%s.%s', shark, domain),
+		'filter': new UUIDBloomFilter({ path: filterPath }),
 		'nameservice': mod_util.format('%s.%s', 'nameservice', domain),
 		'begin': begin,
 		'end': end,
